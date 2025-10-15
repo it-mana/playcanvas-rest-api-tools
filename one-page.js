@@ -30,12 +30,76 @@ function inlineAssets(projectPath) {
 
             var addLibraryFile = function (filename) {
                 var patchLocation = path.resolve(projectPath, filename);
-                fs.copyFileSync('library-files/' + filename, patchLocation);
+                fs.copyFileSync(path.join(__dirname, 'library-files', filename), patchLocation);
                 indexContents = indexContents.replace(
                     '<head>',
                     '<head>\n    <script src="' + filename + '"></script>'
                 );
             };
+
+            // Detect if project uses Draco compression
+            var hasDracoAssets = false;
+            var dracoFiles = {
+                'draco.js': null,
+                'draco.wasm.js': null,
+                'draco.wasm.wasm': null
+            };
+
+            (function () {
+                console.log("↪️ Detecting Draco compressed assets");
+                
+                // Check for Draco decoder files in project (they may be in subdirectories)
+                // We need to search recursively since PlayCanvas stores them in files/assets/ID/VERSION/ structure
+                var findDracoFile = function(filename) {
+                    // Try common locations
+                    var locations = [
+                        path.resolve(projectPath, filename),  // Root
+                        path.resolve(projectPath, 'files', filename),  // files/
+                    ];
+                    
+                    // Also search in files/assets subdirectories
+                    try {
+                        var filesPath = path.resolve(projectPath, 'files', 'assets');
+                        if (fs.existsSync(filesPath)) {
+                            var assetDirs = fs.readdirSync(filesPath);
+                            assetDirs.forEach(function(assetId) {
+                                var assetPath = path.join(filesPath, assetId);
+                                if (fs.statSync(assetPath).isDirectory()) {
+                                    var versionDirs = fs.readdirSync(assetPath);
+                                    versionDirs.forEach(function(version) {
+                                        locations.push(path.join(assetPath, version, filename));
+                                    });
+                                }
+                            });
+                        }
+                    } catch (e) {
+                        // Ignore search errors
+                    }
+                    
+                    // Return first existing location
+                    for (var i = 0; i < locations.length; i++) {
+                        if (fs.existsSync(locations[i])) {
+                            return locations[i];
+                        }
+                    }
+                    return null;
+                };
+                
+                for (var filename in dracoFiles) {
+                    var filepath = findDracoFile(filename);
+                    if (filepath) {
+                        hasDracoAssets = true;
+                        dracoFiles[filename] = filepath;
+                        console.log("   Found Draco file: " + filename + " at " + filepath);
+                    }
+                }
+                
+                if (hasDracoAssets) {
+                    console.log("✓ Draco compression detected - will embed decoder");
+                } else {
+                    console.log("   No Draco files found");
+                }
+            })();
 
             (function () {
                 // Patch the http get function to check for an object being passed to it and return immediately
@@ -52,6 +116,12 @@ function inlineAssets(projectPath) {
                 if (config.one_page.patch_xhr_out) {
                     console.log("↪️ Adding no XHR engine patch");
                     addPatchFile('one-page-no-xhr-request.js');
+                }
+
+                // Add Draco decoder initialization patch if project uses Draco
+                if (hasDracoAssets) {
+                    console.log("↪️ Adding Draco decoder inline patch");
+                    addPatchFile('one-page-draco-decoder.js');
                 }
 
                 // Inline game scripts patch. Some platforms block base64 JS code so this overrides the addition
@@ -162,6 +232,9 @@ function inlineAssets(projectPath) {
 
                 var configJson = JSON.parse(contents);
                 var assets = configJson.assets;
+                
+                // Track Draco asset IDs to remove them later (they'll be embedded inline, not loaded as assets)
+                var dracoAssetIds = [];
 
                 var sizeReport = [];
 
@@ -176,6 +249,18 @@ function inlineAssets(projectPath) {
                     }
 
                     var url = unescape(asset.file.url);
+                    
+                    // Check if this is a Draco decoder file (by name)
+                    var isDracoFile = url.endsWith('draco.js') || url.endsWith('draco.wasm.js') || url.endsWith('draco.wasm.wasm');
+                    
+                    // If this is a Draco file and we're embedding them inline, skip base64 encoding
+                    // and mark for removal from config.json
+                    if (isDracoFile && hasDracoAssets) {
+                        console.log("   Skipping Draco file in config (will be inlined): " + path.basename(url));
+                        dracoAssetIds.push(key);
+                        continue;
+                    }
+                    
                     var urlSplit = url.split('.');
                     var extension = urlSplit[urlSplit.length - 1];
 
@@ -205,8 +290,21 @@ function inlineAssets(projectPath) {
 
                     var mimeprefix = "data:application/octet-stream";
                     switch(extension) {
+                        case "wasm":
+                            // WASM files need correct MIME type for Draco
+                            mimeprefix = "data:application/wasm";
+                        break;
+
                         case "png":
                             mimeprefix = "data:image/png";
+                        break;
+
+                        case "webp":
+                            mimeprefix = "data:image/webp";
+                        break;
+
+                        case "avif":
+                            mimeprefix = "data:image/avif";
                         break;
 
                         case "jpeg":
@@ -269,6 +367,14 @@ function inlineAssets(projectPath) {
                     // Remove the hash to prevent appending to the URL
                     asset.file.hash = "";
                 };
+                
+                // Remove Draco assets from config.json since they're embedded inline
+                if (hasDracoAssets && dracoAssetIds.length > 0) {
+                    console.log("   Removing " + dracoAssetIds.length + " Draco decoder assets from config.json");
+                    dracoAssetIds.forEach(function(assetId) {
+                        delete assets[assetId];
+                    });
+                }
 
                 if (process.argv.includes('--size-report')) {
                     sizeReport.sort((a, b) => b.size - a.size);
@@ -351,6 +457,12 @@ function inlineAssets(projectPath) {
                     contents = contents.replace(regex, "reflow: function(app, canvas){canvas.style.width=\"\",canvas.style.height=\"\",app.resizeCanvas()}");
                 }
 
+                // Expose app to window for debugging and Draco integration
+                contents = contents.replace(
+                    'var app = new pc.AppBase(canvas);',
+                    'var app = new pc.AppBase(canvas);\n    window.app = app; // Expose for debugging and Draco integration'
+                );
+
                 fs.writeFileSync(location, contents);
             })();
 
@@ -397,6 +509,75 @@ function inlineAssets(projectPath) {
             await (async function() {
                 console.log("↪️ Inline JS scripts in index.html");
 
+                // Handle Draco decoder files specially - they must be inlined in correct order
+                if (hasDracoAssets) {
+                    console.log("↪️ Embedding Draco decoder files");
+                    
+                    // Add LZ4 library for decompression
+                    addLibraryFile('lz4.js');
+                    
+                    // Build a combined decompression script
+                    var dracoDecompressionScript = '<script>\n// Draco decompression (LZ4)\n!function(){';
+                    
+                    // STEP 1: Compress and inline WASM binary
+                    if (dracoFiles['draco.wasm.wasm']) {
+                        var wasmPath = dracoFiles['draco.wasm.wasm'];
+                        var wasmBytes = fs.readFileSync(wasmPath);
+                        var originalWasmSize = wasmBytes.length;
+                        
+                        // Compress WASM with LZ4
+                        var compressedWasm = lz4.compress(wasmBytes);
+                        var wasmBase64 = Buffer.from(compressedWasm).toString('base64');
+                        
+                        console.log("   Embedding draco.wasm.wasm (" + originalWasmSize + " bytes → " + compressedWasm.length + " bytes compressed)");
+                        
+                        // Decompress and store WASM
+                        dracoDecompressionScript += 
+                            'var w=new Buffer("' + wasmBase64 + '","base64"),' +
+                            'wb=lz4.decompress(w);' +
+                            'window.__DRACO_WASM_BINARY__=wb.buffer;' +
+                            'console.log("[Draco] WASM decompressed",wb.length,"bytes");';
+                    }
+                    
+                    // STEP 2: Compress and inline draco.wasm.js (WASM glue code) or draco.js (ASM.js fallback)
+                    var dracoDecoderFile = dracoFiles['draco.wasm.js'] || dracoFiles['draco.js'];
+                    if (dracoDecoderFile) {
+                        var decoderContent = fs.readFileSync(dracoDecoderFile, 'utf-8');
+                        var decoderName = path.basename(dracoDecoderFile);
+                        var originalDecoderSize = decoderContent.length;
+                        
+                        // Compress decoder with LZ4
+                        var compressedDecoder = lz4.compress(Buffer.from(decoderContent));
+                        var decoderBase64 = Buffer.from(compressedDecoder).toString('base64');
+                        
+                        console.log("   Embedding " + decoderName + " (" + originalDecoderSize + " bytes → " + compressedDecoder.length + " bytes compressed)");
+                        
+                        // Decompress, store for workers, and execute
+                        dracoDecompressionScript += 
+                            'var d=new Buffer("' + decoderBase64 + '","base64"),' +
+                            'dc=Buffer.from(lz4.decompress(d)).toString();' +
+                            'window.__DRACO_DECODER_CODE__=dc;' +
+                            'console.log("[Draco] Decoder decompressed",dc.length,"bytes");' +
+                            'var s=document.createElement("script");' +
+                            's.async=!1;' +
+                            's.innerText=dc;' +
+                            'document.head.appendChild(s);';
+                        
+                        // Mark these files as handled so they won't be processed again below
+                        externFiles.push('draco.wasm.wasm');
+                        externFiles.push('draco.wasm.js');
+                        externFiles.push('draco.js');
+                    }
+                    
+                    dracoDecompressionScript += '}();\n</script>';
+                    
+                    // Insert the combined decompression script before the engine
+                    indexContents = indexContents.replace(
+                        '<script src="playcanvas-stable.min.js"></script>',
+                        dracoDecompressionScript + '\n    <script src="playcanvas-stable.min.js"></script>'
+                    );
+                }
+
                 // If true, we will not embed the JS files
                 var externFilesConfig = config.one_page.extern_files;
                 var urlRegex = /<script src="(.*)"><\/script>/g;
@@ -404,6 +585,12 @@ function inlineAssets(projectPath) {
 
                 for (const element of urlMatches) {
                     var url = element[1];
+                    
+                    // Skip Draco files - they're handled specially above
+                    if (url === 'draco.js' || url === 'draco.wasm.js' || url === 'draco.wasm.wasm') {
+                        console.log("   Skipping Draco file (already inlined): " + url);
+                        continue;
+                    }
 
                     var filepath = path.resolve(projectPath, url);
                     if (!fs.existsSync(filepath)) {
